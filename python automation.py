@@ -259,20 +259,7 @@ def load_lookup_table(path: str) -> pd.DataFrame | None:
 # REPORT
 # =====================
 
-def build_ausw_mok(df: pd.DataFrame, report_date=None) -> dict[str, pd.DataFrame]:
-    """
-    Baut die eigentliche Auswertung 'Ausw MOK' nach.
-
-    Rückgabe:
-    {
-        "summary": Kennzahlen links,
-        "stunden": Stundenmatrix 0-1 bis 16-17
-    }
-
-    WICHTIG:
-    Für die Tour-Spalten wird eine Kategorie-Spalte erwartet:
-    - Tour_Kategorie mit Werten wie "GK", "P", "N"
-    """
+def build_ausw_mok(df: pd.DataFrame, report_date=None, history_df: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
 
     df = df.copy()
 
@@ -456,12 +443,125 @@ def build_ausw_mok(df: pd.DataFrame, report_date=None) -> dict[str, pd.DataFrame
 
     summary_df["Wert"] = pd.to_numeric(summary_df["Wert"], errors="coerce")
 
+    vergleich_df = build_vergleich_block(
+    summary_df=summary_df,
+    history_df=history_df if history_df is not None else pd.DataFrame(),
+    report_date=report_date,
+    )
+
     return {
         "summary": summary_df,
         "stunden": stunden_df,
+        "vergleich": vergleich_df,
     }
 
+def build_vergleich_block(summary_df: pd.DataFrame, history_df: pd.DataFrame, report_date) -> pd.DataFrame:
+    report_date = pd.to_datetime(report_date).date()
 
+    if summary_df.empty:
+        return pd.DataFrame()
+
+    if history_df.empty:
+        return pd.DataFrame(
+            {
+                "Kennzahl": ["Vol/POS", "Picks/POS", "POS/BH", "POS/Haltepunkt", "Volumenauslastung", "Anteil BE ungleich OVE"],
+                "Vortag": [pd.NA] * 6,
+                "Differenz_Vortag": [pd.NA] * 6,
+                "Monat_aufgelaufen": [pd.NA] * 6,
+                "Differenz_Monat": [pd.NA] * 6,
+                "Jahr_aufgelaufen": [pd.NA] * 6,
+                "Differenz_Jahr": [pd.NA] * 6,
+                "Vorjahr_aufgelaufen": [pd.NA] * 6,
+                "Differenz_Vorjahr": [pd.NA] * 6,
+            }
+        )
+
+    hist = history_df.copy()
+    hist["KOMMDATUM"] = pd.to_datetime(hist["KOMMDATUM"], errors="coerce").dt.date #nur Datum, keine Uhrzeit
+
+    # Historie pro Tag auf Tageswerte verdichten
+    hist_daily = (
+        hist.groupby(["KOMMDATUM", "Bereich"], as_index=False)
+        .agg(
+            Vol_POS=("Vol/POS", "mean"),
+            Picks_POS=("Picks/POS", "mean"),
+            POS_Haltepunkt=("POS/Haltepunkt", "mean"),
+            Volumenauslastung=("Volumenauslastung", "mean"),
+            Anteil_BE_ungleich_OVE=("Anteil BE ungleich OVE", "mean"),
+        )
+    )
+
+
+    current_map = dict(zip(summary_df["Kennzahl"], summary_df["Wert"])) # macht aus den Kennzahlen und Werten im summary_df ein dictionary
+
+    metric_map = [ # definiert, welche Kennzahlen wir vergleichen wollen und wie sie in der Historie heißen
+        ("Vol/POS", "MOK Vol/POS", "Vol_POS"),
+        ("Picks/POS", "MOK Picks/POS", "Picks_POS"),
+        ("POS/BH", "MOK POS/BH", None),
+        ("POS/Haltepunkt", "MOK POS/Haltepunkt", "POS_Haltepunkt"),
+        ("Volumenauslastung", "MOK Volumenauslastung", "Volumenauslastung"),
+        ("Anteil BE ungleich OVE", "MOK Anteil BE ungleich OVE", "Anteil_BE_ungleich_OVE"),
+    ]
+
+    vortag = report_date - timedelta(days=1)
+    month_start = report_date.replace(day=1) #setzt den Tag auf den ersten des Monats, um den Beginn des Monats zu markieren
+    year_start = report_date.replace(month=1, day=1)
+    prev_year_start = report_date.replace(year=report_date.year - 1, month=1, day=1)
+    prev_year_same_day = report_date.replace(year=report_date.year - 1)
+
+    def get_value_for_day(target_date, hist_col):
+        if hist_col is None:
+            return pd.NA
+        temp = hist_daily[(hist_daily["KOMMDATUM"] == target_date) & (hist_daily["Bereich"] == "MOK")] #
+        if temp.empty:
+            return pd.NA
+        return pd.to_numeric(temp[hist_col], errors="coerce").iloc[0]
+
+    def get_period_mean(start_date, end_date, hist_col): # berechnet den Durchschnittswert für die Periode von start_date bis end_date. 
+        if hist_col is None:
+            return pd.NA
+        temp = hist_daily[
+            (hist_daily["KOMMDATUM"] >= start_date) &
+            (hist_daily["KOMMDATUM"] <= end_date) &
+            (hist_daily["Bereich"] == "MOK")
+        ]
+        if temp.empty:
+            return pd.NA
+        values = pd.to_numeric(temp[hist_col], errors="coerce").dropna()
+        if values.empty:
+            return pd.NA
+        return values.mean()
+
+    def calc_diff(current_value, reference_value): # differnz
+        if pd.isna(current_value) or pd.isna(reference_value) or reference_value == 0:
+            return pd.NA
+        return (current_value / reference_value) - 1
+
+    rows = []
+
+    for label, summary_key, hist_col in metric_map:
+        current_value = pd.to_numeric(pd.Series([current_map.get(summary_key, pd.NA)]), errors="coerce").iloc[0]
+
+        value_vortag = get_value_for_day(vortag, hist_col)
+        value_monat = get_period_mean(month_start, report_date, hist_col)
+        value_jahr = get_period_mean(year_start, report_date, hist_col)
+        value_vorjahr = get_period_mean(prev_year_start, prev_year_same_day, hist_col)
+
+        rows.append(
+            {
+                "Kennzahl": label,
+                "Vortag": value_vortag,
+                "Differenz_Vortag": calc_diff(current_value, value_vortag),
+                "Monat_aufgelaufen": value_monat,
+                "Differenz_Monat": calc_diff(current_value, value_monat),
+                "Jahr_aufgelaufen": value_jahr,
+                "Differenz_Jahr": calc_diff(current_value, value_jahr),
+                "Vorjahr_aufgelaufen": value_vorjahr,
+                "Differenz_Vorjahr": calc_diff(current_value, value_vorjahr),
+            }
+        )
+
+    return pd.DataFrame(rows)
 # =====================
 # HISTORY
 # =====================
@@ -473,10 +573,7 @@ def build_history_payload(ausw_mok_df: pd.DataFrame) -> pd.DataFrame:
 def load_history(path: str) -> pd.DataFrame:
     p = Path(path)
     if not p.exists():
-        return pd.DataFrame()
-
-    if p.suffix.lower() == ".parquet":
-        return pd.read_parquet(p)
+        return pd.DataFrame() #leere Historie zurückgeben
     if p.suffix.lower() == ".csv":
         return pd.read_csv(p)
     if p.suffix.lower() in {".xlsx", ".xls"}:
@@ -487,11 +584,9 @@ def load_history(path: str) -> pd.DataFrame:
 
 def save_history(df: pd.DataFrame, path: str) -> None:
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p.parent.mkdir(parents=True, exist_ok=True) # Stelle sicher, dass das Verzeichnis für die Historie existiert
 
-    if p.suffix.lower() == ".parquet":
-        df.to_parquet(p, index=False)
-    elif p.suffix.lower() == ".csv":
+    if p.suffix.lower() == ".csv":
         df.to_csv(p, index=False, sep=";")
     elif p.suffix.lower() in {".xlsx", ".xls"}:
         df.to_excel(p, index=False)
@@ -566,8 +661,8 @@ def build_report_tables(
 
     return {
         "Detaildaten": detail,
-        "Ausw_MOK_Summary": summary_df,  # Das ist die neue zentrale Auswertung links
-        "Ausw_MOK_Stunden": stunden_df,  # Das ist die neue zentrale Auswertung rechts
+        "Ausw_MOK_Summary": summary_df,  
+        "Ausw_MOK_Stunden": stunden_df,  
         "Stundenreport": summary_by_hour,
         "Bereichsreport": summary_by_area,
         "Historie": history_df,
@@ -613,25 +708,30 @@ def main() -> None:
     raw_df = fetch_data(report_date)
     raw_df = normalize_types(raw_df)
 
-    lookup_df = load_lookup_table(LOOKUP_FILE)
+    lookup_df = load_lookup_table(LOOKUP_FILE) #Laufmeter, usw. laden
     enriched_df = add_business_columns(raw_df, lookup_df)
 
-    ausw_mok = build_ausw_mok(enriched_df, report_date)
+    existing_history = load_history(HISTORY_FILE)
+
+    ausw_mok = build_ausw_mok(enriched_df, report_date, existing_history)
 
     summary_df = ausw_mok["summary"]
     stunden_df = ausw_mok["stunden"]
+    vergleich_df = ausw_mok["vergleich"]
 
     new_history = build_history_payload(stunden_df)
-    existing_history = load_history(HISTORY_FILE)
     full_history = append_and_deduplicate_history(existing_history, new_history)
     save_history(full_history, HISTORY_FILE)
 
-    report_tables = build_report_tables(enriched_df, summary_df, stunden_df, full_history)
+    report_tables = {
+        "Detaildaten": enriched_df,
+        "Ausw_MOK_Summary": summary_df,
+        "Ausw_MOK_Stunden": stunden_df,
+        "Ausw_MOK_Vergleich": vergleich_df
+    }
+
     export_report(report_tables, output_path)
 
-    subject = f"Positionsauswertung Vortag MOK ({report_date}) 0-24 Uhr"
-    body = "Automatisch generiert – bitte prüfen."
-    create_outlook_mail_send(MAIL_TO, MAIL_CC, subject, body, output_path)
     logging.info("Finished successfully")
     logging.info("Output file: %s", output_path)
     logging.info("History file: %s", HISTORY_FILE)
